@@ -2383,7 +2383,9 @@ void DBImpl::TrackExistingDataFiles(
 // 为什么是文件锁，而不是mutex
 // 因为文件锁是操作系统级别的，而mutex是进程内的，如果多个进程同时打开同一个数据库目录，就会出现竞态条件
 // 而文件锁可以保证在任何时候只有一个进程能够成功打开并持有同一个数据库目录
-
+//
+// 这个函数通过其严谨的步骤、多层级的校验和完善的错误处理机制，确保了Rocksdb数据库无论从何种状态（正常关闭、异常崩溃、首次创建）启动，
+// 都能进入一个数据一致、可供使用的状态
 Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     const std::vector<ColumnFamilyDescriptor>& column_families,
                     std::vector<ColumnFamilyHandle*>* handles,
@@ -2407,6 +2409,8 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   assert(handles);
   handles->clear();
 
+  // 循环遍历所有列族，找出其中最大的write_buffer_size，这个值稍后会用于
+  // 决定为新的WAL文件预分配多大的空间，这是一个性能优化
   size_t max_write_buffer_size = 0;
   MinAndMaxPreserveSeconds preserve_info;
   for (const auto& cf : column_families) {
@@ -2456,15 +2460,52 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
 
   impl->wal_in_db_path_ = impl->immutable_db_options_.IsWalDirSameAsDBPath();
   RecoveryContext recovery_ctx;
+  // mutex_ 是核心状态锁（The Main Lock），是DBImpl中最核心，最繁忙的锁
+  // options_mutex_ 是配置锁，是一个目的更专一、使用频率更低的锁，只保护那些可以被动态修改的数据库配置项
+  // 为什么需要两个锁？
+  // 核心原因：减少不必要的等待，提高并发度
+  // 通过将锁分离：
+  // * 修改配置的操作（不频繁）锁住 options_mutex_
+  // * 高频的读写操作主要和 mutex_ 打交道
+  // 减少了锁的争用范围
   impl->options_mutex_.Lock();
   impl->mutex_.Lock();
 
   // Handles create_if_missing, error_if_exists
   uint64_t recovered_seq(kMaxSequenceNumber);
+  // Recover函数是DBImpl::Open调用的一个核心成员函数，作用可以概述为一句话：
+  // 读取磁盘上的元数据（'MANIFEST'）和日志('WAL')，在内存中完整地、一致地重建出数据库在上次关闭（或崩溃）时的状态。
+  // 可以理解为一次“现场重建”工作，DBImpl对象在new出来的时候知识一个空壳，Recover函数负责调用磁盘上的
+  // “蓝图”和“笔记”将这个空壳填充成一个功能完整的、数据一致的数据库。
+  // 
+  // 这个重建过程主要由两大核心任务组成：
+  // 任务一. 从MANIFEST文件回复数据库的“骨架”
+  // 这是恢复的第一步，目的是搞清楚数据库的文件结构
+  // 1. 定位'MANIFEST'：
+  // * Recover 首先会查找数据库目录下的 CURRENT 文件
+  // * CURRENT 是一个简单的文本文件，里面只记录了当前生效的MANIFEST文件的文件名
+  // 2. 重放‘MANIFEST’
+  // * MANIFEST 文件本身是一个日志，记录了数据库文件状态的每一次变更，例如“添加了 100.sst 到 L0”、“删除了88.sst”
+  // 这些变更记录被称为 VersionEdit
+  // * Recover会委托 VersionSet组件从头到尾读取MANIFEST文件中的所有VersionEdit记录，并依次应用它们
+  // * 这个过程完成后，VersionSet对象就在内存中建立起了一副完整的“地图”，精确描绘出：
+  //   * 数据库中有哪些列族
+  //   * 每个列族有几个Level
+  //   * 每个Level中包含哪些SSTable文件
+  //   * 每个SSTable文件的键范围、大小等元信息
+  // 经过任务一之后，Rocksdb就知道了所有持久化在SSTable中的数据在哪里，但还不知道那些只存在于日志、尚未写入SSTable的数据
+  //
+  // 任务二：从WAL文件恢复
+  // 这是恢复的第二步，目的是找回那些在上次关闭时还停留在内存memtable中的数据，这些数据虽然没被写入SSTable，但因为已经写入了
+  // WAL，所以是持久化的，可以被恢复
+  // 
+  // 经过这两个任务之后，确保了无论是正常关闭还是异常掉电，当数据库再次Open时，都能恢复到最后一个一致性的状态，不会丢失任何已提交的数据。
   s = impl->Recover(column_families, false /* read_only */,
                     false /* error_if_wal_file_exists */,
                     false /* error_if_data_exists_in_wals */, is_retry,
                     &recovered_seq, &recovery_ctx, can_retry);
+
+  // 如果 Recover 成功，数据库的内存状态已经恢复，但还需要为接下来的写入操作准备一个新的WAL文件
   if (s.ok()) {
     uint64_t new_log_number = impl->versions_->NewFileNumber();
     log::Writer* new_log = nullptr;
@@ -2474,6 +2515,7 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
     // created during DB open with predecessor WALs from previous DB session due
     // to `avoid_flush_during_recovery == true`. This can protect the last WAL
     // recovered.
+    // 创建一个新的、空的WAL文件，用于接收Open之后的所有新写入
     s = impl->CreateWAL(write_options, new_log_number, 0 /*recycle_log_number*/,
                         preallocate_block_size,
                         PredecessorWALInfo() /* predecessor_wal_info */,
@@ -2484,6 +2526,9 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       impl->min_wal_number_to_recycle_ = new_log_number;
     }
     if (s.ok()) {
+      // RAAI
+      // 可以理解为Rocksdb自己实现的、带有性能统计功能的std::lock_guard或std::scoped_lock
+      // 
       InstrumentedMutexLock wl(&impl->wal_write_mutex_);
       impl->cur_wal_number_ = new_log_number;
       assert(new_log != nullptr);
@@ -2502,6 +2547,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       // empty, and thus missing the consecutive seq hint to distinguish
       // middle-log corruption to corrupted-log-remained-after-recovery. This
       // case also will be addressed by a dummy write.
+      // 如果数据库不是全新的（即recovered_seq有一个有效值），程序会立即向新的WAL文件写入一个
+      // 只包含序列号的空`WriteBatch`.
+      // * 目的：这是为了保证WAL文件中的序列号是连续的，它为下一次可能的恢复提供了一个明确的“起点”，解决了在某些
+      // 恢复模式下因新日志文件为空而无法判断其与旧日志文件是否连续的问题。
+      // * 为了确保这个“标记”不丢失，它会被立即Sync到磁盘
       if (recovered_seq != kMaxSequenceNumber) {
         WriteBatch empty_batch;
         WriteBatchInternal::SetSequence(&empty_batch, recovered_seq);
@@ -2529,7 +2579,11 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
       }
     }
   }
+
+  // 所有恢复和准备工作都已完成，现在需要将这些变更持久化，并正式“启动”数据库
   if (s.ok()) {
+    // 将恢复过程中所有的元数据变更（如每个列族新的 log_number ）写入MANIFEST文件
+    // 这标志着恢复过程的“逻辑提交”
     s = impl->LogAndApplyForRecovery(recovery_ctx);
   }
 
