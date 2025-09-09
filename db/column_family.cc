@@ -43,6 +43,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// ColumnFamilyHandleImpl是ColumnFamilyHandle的实现类
+// 是RocksDB里面用来管理列族（Column Family）的核心类之一
+// 
 ColumnFamilyHandleImpl::ColumnFamilyHandleImpl(
     ColumnFamilyData* column_family_data, DBImpl* db, InstrumentedMutex* mutex)
     : cfd_(column_family_data), db_(db), mutex_(mutex) {

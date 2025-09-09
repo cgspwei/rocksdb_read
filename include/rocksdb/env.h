@@ -442,12 +442,19 @@ class Env : public Customizable {
   static std::string PriorityToString(Priority priority);
 
   // Priority for requesting bytes in rate limiter scheduler
+  // RateLimiter是限制RocksDB对磁盘的总I/O带宽，这在共享磁盘环境或需要控制rocksdb资源消耗的场景中非常有用
+  // 一个简单的总带宽限制是不够的，因为rocksdb内部有多种不同类型的I/O请求，它们的紧急程度和重要性各不相同，例如
+  // * 用户前台发起的读请求（Get）,需要尽快响应，否则会感到卡顿
+  // * 后台的压缩Compaction任务，虽然重要，但通常不那么紧急
+  // * 后台的刷盘Flush任务，比压缩更紧急，引入如果它不及时完成，可能会阻塞新的写入
+  // IOPriority就是为了区分这些不同类型的I/O请求，并让RateLimiter能够智能分配带宽，优先满足高优先级请求
+  // 从而在控制总带宽的同时，保证用户请求的低延迟
   enum IOPriority {
-    IO_LOW = 0,
-    IO_MID = 1,
-    IO_HIGH = 2,
-    IO_USER = 3,
-    IO_TOTAL = 4
+    IO_LOW = 0,  // 用于低优先级的后台任务，最主要的用途就是Compaction操作
+    IO_MID = 1,  // 用于中优先级的后台任务，主要用于其他后台操作，不常用，可以用于用户手动触发的压缩
+    IO_HIGH = 2,  // 用于高优先级的后台任务，最主要的用途就是Flush操作
+    IO_USER = 3,  // 用于用户请求的I/O操作，需要最低延迟，主要是读请求需要从磁盘读取数据块， 保证用户感知的读延迟尽可能低
+    IO_TOTAL = 4 
   };
 
   // EXPERIMENTAL

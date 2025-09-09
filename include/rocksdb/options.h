@@ -1673,6 +1673,22 @@ struct DBOptions {
 };
 
 // Options to control the behavior of a database (passed to DB::Open)
+// Rocksdb最初是基于LevelDB分叉而来的，LevelDB并没有ColumnFamily这个概念，在RocksDB早期版本中
+// 也只有一个统一的、巨大的Options结构体，包含了所有的配置项
+// 后来Rocksdb引入了革命性的列族功能，这些功能允许在同一个数据库中存在多个逻辑隔离的键值空间，每个空间
+// 都可以有自己独立的配置，例如不同的memtable_size, comparator, merge_operator等等
+// 这就带来了一个设计上的挑战：
+// * 哪些配置是全局的（如wal_dir, max_open_files等）
+// * 哪些配置是每个列族独有的
+// 为了解决这个问题，开发团队将配置项拆分成了两个新的结构体：
+// 1. DBOptions：存放全局的，数据库实例级别的配置
+// 2. ColumnFamilyOptions：存放每个列族独有的配置
+// 这样做可以确保配置的清晰和一致性，同时也可以提高配置的灵活性
+// 但是如果直接废弃旧的Options类和旧的DB::Open接口，所有现存的Rocksdb代码都会编译失败，
+// 解决方案就是今天我们看到的这个设计：让Options同时继承DBOptions和ColumnFamilyOptions
+// 用户可以用默认的Options配置（包含了默认的DBoptions和ColumnFamilyOptions）
+// 也可以自己分别创建db_options和column_family_options传入其中
+// 总之，Options的多重继承设计是一个非常务实的工程决策，在引入列族功能的同时，保持了对旧代码的兼容性
 struct Options : public DBOptions, public ColumnFamilyOptions {
   // Create an Options object with default values for all fields.
   Options() : DBOptions(), ColumnFamilyOptions() {}
@@ -1700,20 +1716,43 @@ struct Options : public DBOptions, public ColumnFamilyOptions {
   // constructor is to enable chaining of multiple similar calls in the future.
   //
 
+  // Options里面的配置太多，有很大的心智负担
+  // 下面这三个方法的存在，可以理解为Rocksdb官方提供的“一键式配置套餐”或“官方推荐配方”
   // All data will be in level 0 without any automatic compaction.
   // It's recommended to manually call CompactRange(NULL, NULL) before reading
   // from the database, because otherwise the read can be very slow.
+  // 为海量数据导入做准备
+  // 目标：配置rocksdb以实现最快的数据写入/加载速度，在批量导入数据时，我们只关心写入吞吐量，而暂时不关心
+  // 读取性能和存储空间的紧凑性
+  // 1. 增加memtable大小和数量，允许在内存中缓存更多的写入数据后再批量刷盘，减少I/O次数
+  // 2. 禁用自动压缩(disable_auto_compactions = true)
+  // 这是最关键的一步，在批量导入数据期间，频繁的后台压缩会与前台写入争抢I/O和CPU资源，严重影响写入速度
+  // 该方法会禁用自动压缩，让所有数据快速堆积在Level-0
+  // 3. 优化Level-0的触发机制，进一步推迟后台工作的介入
+  // 注意，在调用PrepareForBulkLoad完成数据导入后，建议手动调用一次db->CompactRange(nullptr, nullptr)
+  // 来对整个数据库进行一次全量压缩，这样才能将数据库整理好，为后续的正常读写提供良好的性能。
   Options* PrepareForBulkLoad();
 
   // Use this if your DB is very small (like under 1GB) and you don't want to
   // spend lots of memory for memtables.
+  // 最大限度减少Rockdb的内存占用，适用于数据库总大小很小（例如小于1GB）且内存资源非常宝贵的场景
+  // 1. 减小Block Cache
+  // 将块缓存的大小设置的非常小，因为数据量小，大部分可能可以直接由操作系统的文件缓存来处理
+  // 2. 减小Write Buffer大小：小数据库通常写入量不大，不需要大的memtable
+  // 3. 减小max_open_files
+  // 4. 内部会调用OptimizeForPointLookup()，因为小数据库通常用于点查场景
   Options* OptimizeForSmallDb();
 
   // Disable some checks that should not be necessary in the absence of
   // software logic errors or CPU+memory hardware errors. This can improve
   // write speeds but is only recommended for temporary use. Does not
   // change protection against corrupt storage (e.g. verify_checksums).
+  // 压榨出极致的性能，通过关闭一些用于保证数据安全但会带来微小性能开销的内部校验
   Options* DisableExtraChecks();
+
+  // 以上这三个方法的设计，将专家级的调优封装成了简单的API
+  // 此外，这些方法都返回Options*，这意味着可以进行链式调用，也是一种非常流畅的API设计风格
+  // options.PrepareForBulkLoad()->OptimizeUniversalStyleCompaction();
 };
 
 // An application can issue a read request (via Get/Iterators) and specify
@@ -1722,6 +1761,14 @@ struct Options : public DBOptions, public ColumnFamilyOptions {
 // Get call will process data that is already processed in the memtable or
 // the block cache. It will not page in data from the OS cache or data that
 // resides in storage.
+// ReadTier是一个用于性能调优的高级选项，允许在执行读操作时，精确地控制RocksDB应该搜索到存储层次的哪一层
+// RocksDB查找一个key时的数据读取路径，这个路径有好几个层次Tier，从最快到最慢依次是：
+// 1. MemTable：内存
+// 2. Block Cache：内存，rocksdb自己管理的读缓存，用于缓存从磁盘SSTable文件中读取出来的数据块（Block），如果命中，速度也很快
+// 3. OS Page Cache：内存，操作系统的文件缓存，如果Rocksdb的文件数据被操作系统缓存了，读取速度也较快，但比rocksdb自己的block cache慢，
+// 且rocksdb无法直接控制
+// 4. persistent storage：ssd或hdd，如果以上三层都未命中，就必须从磁盘读取数据
+// ReadTier的作用是：对某一次读请求下达一个指令：“最多只允许查到第N层，如果还没找大，就不要继续往下查了”
 enum ReadTier {
   kReadAllTier = 0x0,     // data in memtable, block cache, OS cache or storage
   kBlockCacheTier = 0x1,  // data in memtable or block cache

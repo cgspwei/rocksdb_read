@@ -209,11 +209,15 @@ Status ValidateOptionsByTable(
 }
 }  // namespace
 
+// 对用户提供的所有配置（包括全局的DBOptions和每个ColumnFamily的ColumnFamilyOptions）进行一次全面的、快速的检查
+// 以确保这些配置是合法且不存在内部冲突的
+// 接收两个参数：全局的db_options和所有待打开列族描述符的vector
 Status DBImpl::ValidateOptions(
     const DBOptions& db_options,
     const std::vector<ColumnFamilyDescriptor>& column_families) {
   Status s;
   for (auto& cfd : column_families) {
+    // 某些列族的配置可能需要依赖于或需要与全局配置进行比较
     s = ColumnFamilyData::ValidateOptions(db_options, cfd.options);
     if (!s.ok()) {
       return s;
@@ -225,6 +229,7 @@ Status DBImpl::ValidateOptions(
       }
     }
   }
+  // 检查那些与列族无关的、纯粹的全局配置
   s = ValidateOptions(db_options);
   return s;
 }
@@ -2371,6 +2376,13 @@ void DBImpl::TrackExistingDataFiles(
     const std::vector<std::string>& existing_data_files) {
   TrackOrUntrackFiles(existing_data_files, /*track=*/true);
 }
+
+
+// DBImpl::Open的实现本身不是线程安全的，也不需要是线程安全的，因为它依赖一个更底层的机制：文件锁，
+// 来保证在任何时候只有一个进程（或线程）能够成功打开并持有同一个数据库目录
+// 为什么是文件锁，而不是mutex
+// 因为文件锁是操作系统级别的，而mutex是进程内的，如果多个进程同时打开同一个数据库目录，就会出现竞态条件
+// 而文件锁可以保证在任何时候只有一个进程能够成功打开并持有同一个数据库目录
 
 Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
                     const std::vector<ColumnFamilyDescriptor>& column_families,

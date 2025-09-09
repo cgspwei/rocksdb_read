@@ -6,6 +6,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+// 这个文件是rocksdb对外暴露的接口，rocksdb的用户应该只使用这个文件
+// 理解这个文件，rocksdb对外提供了一些什么样的功能
 #pragma once
 
 #include <stdint.h>
@@ -36,10 +38,17 @@
 #include "rocksdb/wide_columns.h"
 
 #if defined(__GNUC__) || defined(__clang__)
+// 在c++14中，引入了跨平台的[[deprecated]]属性，可以在各种主流编译器上通用
+// rocksdb非常积极地使用“deprecated”机制来管理和演进其庞大的API
 #define ROCKSDB_DEPRECATED_FUNC __attribute__((__deprecated__))
 #elif _WIN32
 #define ROCKSDB_DEPRECATED_FUNC __declspec(deprecated)
 #endif
+
+// 类似c++14的用法，不过rocksdb貌似没有广泛使用c++14，代码里面没有用到这个
+// 这个用法可以指定一个函数被废弃了，使用新的函数
+// [[deprecated("Use NewFunction() instead.")]]
+// Status OldFunction(const Options& options);
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -66,6 +75,10 @@ class WriteBatch;
 
 extern const std::string kDefaultColumnFamilyName;
 extern const std::string kPersistentStatsColumnFamilyName;
+// 这个类是rocksdb里面一个非常重要的类，尤其是在使用columnfamily功能时
+// 只有两个成员：
+// 1. name: 列族的名称
+// 2. options: 列族的选项
 struct ColumnFamilyDescriptor {
   std::string name;
   ColumnFamilyOptions options;
@@ -76,6 +89,44 @@ struct ColumnFamilyDescriptor {
       : name(_name), options(_options) {}
 };
 
+// 其核心作用是一个轻量级的、指向一个已打开列族的内部实例的指针或句柄
+// 可以把它想象成fopen函数返回的FILE*文件句柄，我们不会用文件名（字符串）去调用fread或fwrite，而是用fopen返回的FILE*句柄，ColumnFamilyHandle就是这么一个指针或句柄
+// 当调用Put，Get，Delete或创建迭代器时，需要告诉Rocksdb在哪一个列族上执行操作，可以通过传递ColumnFamilyHandle来精确、高效指定目标列族
+// 为什么不直接用字符串的列族名字来作为传递对象呢？
+// 1. 性能：如果每次操作都要传递列族的名字（string），rocksdb内部就需要在一个映射map中查找这个名字，并将其转换成内部的列族对象，这是一个有开销的操作（字符串比较和哈希查找）
+// 而ColumnFamilyHandle本质上就是一个指针，可以直接定位列族，几乎是零开销的，这对于高性能的读写非常重要
+// 2. 唯一标识：句柄代表一个当前正在被打开的、活跃的列族句柄，如果删除了一个列族然后又用相同的名字创建了一个新的，新的列族会有一个新的、不同的句柄。它能确保您的操作是作用于您期望的那个列族实例上。
+// 3. API设计：能够让API变得更清晰
+//
+// ColumnFamilyHandle的生命周期
+// 1. 获取
+// * 在 DB::Open()时，通过 std::vector<ColumnFamilyHandle*> 接收所有打开的列族句柄
+// * 在数据库已经打开时，通过 db->CreateColumnFamily() 创建新的列族时获取其句柄
+// 2. 使用
+// * 将获取的句柄传递给 db->Put(), db->Get(), db->Delete(), db->NewIterator() 等函数
+// 3. 销毁
+// 当不再需要一个列族句柄时，比如在关闭数据库之前，必须调用 db->DestroyColumnFamilyHandle() 来销毁它
+/*
+std::vector<ColumnFamilyHandle*> column_families;
+
+std::vector<ColumnFamilyHandle*> handles;
+DB* db;
+
+// DB::Open()返回每个列族的句柄，顺序与descriptor一致
+Status s = DB::Open(DBOptions(), kDBPath, column_families, &handles, &db);
+assert(s.ok());
+
+s = db->Put(WriteOptions(), handles[1], Slice("key"), Slice("value"));
+s = db->Get(ReadOptions(), handles[1], Slice("key"), &value);
+
+for (auto handle : handles) {
+  s = db->DestroyColumnFamilyHandle(handle);
+  assert(s.ok()); 
+}
+
+delete db;
+*/
+// 总之，ColumnFamilyHandle是与RocksDB中特定列族进行交互的唯一凭证，是高性能和类型设计的关键一环。
 class ColumnFamilyHandle {
  public:
   virtual ~ColumnFamilyHandle() {}
@@ -128,6 +179,12 @@ struct GetMergeOperandsOptions {
 using TablePropertiesCollection =
     std::unordered_map<std::string, std::shared_ptr<const TableProperties>>;
 
+// DB 类是作为RocksDB用户进行几乎所有交互的唯一入口，协调内部所有复杂的组件（内存、磁盘、后台线程等）来响应请求
+// 这是一个abstract base class，只是定义了“能做什么”（contract），具体的实现在rocksdb::DBImpl中
+// 我们不会new一个DB实例，而是通过静态工厂方法 DB::Open() 来获取一个指向 DBImpl 的指针
+// 这种设计模式（接口与实现分离）是C++中非常常见的做法
+// 1. 隐藏复杂性：只需要关心DB提供的接口
+// 2. 稳定的API：只要DB类的公共接口不变，RockDB内部实现可以随意重构和优化，而不会影响你的代码
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
@@ -144,6 +201,12 @@ class DB {
   // this guarantee in a custom Env implementation.)
   //
   // Caller must delete *dbptr when it is no longer needed.
+  // 为什么这里用静态工厂方法
+  // 1. 创建过程复杂：打开一个RocksDB数据库需要涉及很多步骤：读取manifest文件、恢复WAL、加载SSTable文件、
+  // 启动后台线程等，这些复杂的逻辑被封装在Open()方法内部，如果用构造函数，开发者就必须在外部自己处理这些繁琐
+  // 的初始化过程
+  // 2. 错误处理：构造函数无法返回错误状态码
+  // 3. 多态性：在某些情况下，Open方法可能返回一个特殊的DB子类实例，利用用于测试或特殊配置的实现，而用户无需关心这些细节
   static Status Open(const Options& options, const std::string& name,
                      std::unique_ptr<DB>* dbptr);
   // DEPRECATED: raw pointer variant

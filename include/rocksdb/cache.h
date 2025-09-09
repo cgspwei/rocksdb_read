@@ -52,6 +52,21 @@ using RowCache = Cache;
 // updates to `kCacheEntryRoleToCamelString` and
 // `kCacheEntryRoleToHyphenString`. Do not add to this enum after `kMisc` since
 // `kNumCacheEntryRoles` assumes `kMisc` comes last.
+// enum class CacheEntryRole是一个用于标识和分类存储在Block Cache中每个条目“角色”或“用途”的枚举类型
+// 简单来说，它回答了这样一个问题：这个被缓存的数据块，究竟是什么类型的数据？
+// 区分角色的目的主要有：
+// 1. 精细化的统计与监控（observability）：这是最主要的原因，通过为每个缓存条目标记角色，Rocksdb可以进行分类统计
+// 用于后续的性能调优，比如，发现过滤块的命中率很低，导致大量无效的磁盘I/O，就可能需要考虑调整布隆过滤器的参数或增大
+// Block Cache的总容量
+// 2. 实现高级缓存策略
+// * 知道了每个块的角色，就可以实现更智能的缓存策略，一个典型的例子就是“缓存pinning”
+// * 索引块和过滤块对于一次查询的成功至关重要，它们的体积相对较小，但访问频率较高，如果它们被从缓存中淘汰出去，会导致
+// * 后续查询性能急剧下降
+// 因此，可以将索引块和过滤块设置为“pinning”，即在缓存中固定住，不会被轻易淘汰
+// 3. 便于调试和问题排查
+// 
+// CacheEntryRole是一个内部的，但功能强大的分类机制，它让一个简单的Block Cache摇身一变，
+// 成为了一个可观测、可调优、可统一管理多种内存消耗的复杂系统，是RocksDB高性能和高可控性的重要基石。
 enum class CacheEntryRole {
   // Block-based table data block
   kDataBlock,
