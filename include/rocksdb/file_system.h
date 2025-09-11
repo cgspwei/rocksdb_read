@@ -13,7 +13,16 @@
 //
 // WARNING: Since this is a new interface, it is expected that there will be
 // some changes as storage systems are ported over.
-
+// 这是rocksdb总一个非常核心的抽象层，定义了rocksdb与底层存储系统（如本地文件系统、远程文件系统或自定义存储）
+// 交互的所有接口，这个设计使得rocksdb具有高度的灵活性和可移植性
+// 如果没有FileSystem这个抽象类，Rocksdb会面临诸多不便
+// 1. 可移植性差：rocksdb将不得不直接调用操作系统底层的原生文件系统API
+// 2. 扩展性受限：
+//
+// Rocksdb的设计是支持异步io的，它通过FileSystem接口提供了一套完整的异步读取机制（readasync，poll，abortio）
+// 这意味着如果底层的filesystem实现（例如基于linux的io_uring或windows的IOCP）支持异步I/O，
+// rocksdb就可以利用这些功能来提高并发性和吞吐量，尤其是在I/O密集型操作中。
+// 
 #pragma once
 
 #include <stdint.h>
