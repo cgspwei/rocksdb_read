@@ -23,6 +23,14 @@ namespace ROCKSDB_NAMESPACE {
 // Example:
 //   TruncateToPageBoundary(4096, 5000)  => 4096
 //   TruncateToPageBoundary((4096, 10000) => 8192
+// 这个函数的作用是将一个给定的尺寸s向下截断到最接近的、小于或等于s的页面大小`page_size`的倍数。
+// 简单来说，它会找到s之前（或等于s）的最近一个“页面边界”
+// 解释：
+// page_size: 通常是操作系统或文件系统的页面大小，例如4KB（4096字节）。
+// s: 要处理的尺寸。
+// 函数会将s向下截断到最接近的、小于或等于s的页面大小的倍数。
+// 例如，如果page_size是4096，而s是5000，那么函数会返回4096，因为4096是5000之前（或等于5000）的最近一个4096的倍数。
+// 如果s是10000，函数会返回8192，因为8192是10000之前（或等于10000）的最近一个4096的倍数。
 inline size_t TruncateToPageBoundary(size_t page_size, size_t s) {
   s -= (s & (page_size - 1));
   assert((s % page_size) == 0);
